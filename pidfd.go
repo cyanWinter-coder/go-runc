@@ -49,6 +49,11 @@ func NewTempPidfdSocket() (*Socket, error) {
 // It is the caller's responsibility to close the returned file. The pidfd can
 // be used to signal or wait on the process without the pid reuse races that
 // come with a raw pid, e.g. with unix.PidfdSendSignal.
+//
+// ReceivePidfd shares the Socket lifecycle with ReceiveMaster: it fails with
+// ErrSocketClosed after Close, with ErrReceiveTimeout once the deadline set
+// by SetReceiveDeadline passes, and releases any descriptor that arrived
+// before a failed receive.
 func (c *Socket) ReceivePidfd() (*os.File, error) {
 	return c.receive()
 }

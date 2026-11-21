@@ -19,20 +19,54 @@
 package runc
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
+)
+
+// Errors returned by the receive operations of a Socket, so callers can tell
+// apart the ways a file descriptor handoff can fail.
+var (
+	// ErrSocketClosed is returned by a receive on a socket whose Close
+	// method was already called.
+	ErrSocketClosed = errors.New("runc: socket is closed")
+	// ErrPeerClosed is returned when the peer connected but closed the
+	// connection without sending a file descriptor.
+	ErrPeerClosed = errors.New("runc: peer closed the connection without sending a file descriptor")
+	// ErrTruncated is returned when the message carrying the file
+	// descriptor, or its ancillary data, did not fit the receive buffers.
+	ErrTruncated = errors.New("runc: file descriptor message was truncated")
+	// ErrReceiveTimeout is returned when no file descriptor arrived before
+	// the deadline set with SetReceiveDeadline.
+	ErrReceiveTimeout = errors.New("runc: timed out waiting to receive a file descriptor")
 )
 
 // Socket is a unix socket that accepts a file descriptor sent by runc, such as
 // the pty master for the container's console or the pidfd of the process runc
 // creates.
+//
+// A received file descriptor is owned by exactly one party: once a receive
+// succeeds, ownership moves to the returned *os.File and the Socket no longer
+// refers to it. If a receive fails, any descriptor that arrived before the
+// failure is closed by the Socket and must not be used by the caller.
 type Socket struct {
 	rmdir bool
 	l     *net.UnixListener
+
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
+
+	mu       sync.Mutex
+	deadline time.Time
 }
 
 // newSocket creates a new unix socket listening at the provided path.
@@ -82,24 +116,57 @@ func (c *Socket) Path() string {
 	return c.l.Addr().String()
 }
 
-// Close closes the unix socket
-func (c *Socket) Close() error {
-	err := c.l.Close()
-	if c.rmdir {
-		if rErr := os.RemoveAll(filepath.Dir(c.Path())); err == nil { // #nosec G703 -- rmdir is set only for sockets created in a private temporary directory.
-			err = rErr
-		}
+// SetReceiveDeadline sets the deadline for future and pending receive
+// operations on the socket, after which they fail with ErrReceiveTimeout.
+// A zero value disables the timeout.
+func (c *Socket) SetReceiveDeadline(t time.Time) error {
+	if c.closed.Load() {
+		return ErrSocketClosed
 	}
-	return err
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.l.SetDeadline(t)
 }
 
-// receive blocks until the socket receives a file descriptor
+// Close closes the unix socket and removes it from disk if it was created as
+// a temp socket. Pending and future receives fail with ErrSocketClosed.
+// Close is idempotent: calling it more than once returns the result of the
+// first call.
+func (c *Socket) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.closeErr = c.l.Close()
+		if c.rmdir {
+			if rErr := os.RemoveAll(filepath.Dir(c.Path())); c.closeErr == nil { // #nosec G703 -- rmdir is set only for sockets created in a private temporary directory.
+				c.closeErr = rErr
+			}
+		}
+	})
+	return c.closeErr
+}
+
+// receive blocks until the socket receives a file descriptor. On success the
+// descriptor is handed off to the caller exactly once; on failure any
+// descriptor received before the failure is released.
 func (c *Socket) receive() (*os.File, error) {
+	if c.closed.Load() {
+		return nil, ErrSocketClosed
+	}
 	conn, err := c.l.Accept()
 	if err != nil {
-		return nil, err
+		if c.closed.Load() {
+			return nil, ErrSocketClosed
+		}
+		return nil, receiveError(err)
 	}
 	defer conn.Close()
+	c.mu.Lock()
+	deadline := c.deadline
+	c.mu.Unlock()
+	if !deadline.IsZero() {
+		_ = conn.SetReadDeadline(deadline)
+	}
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return nil, fmt.Errorf("received connection which was not a unix socket")
@@ -107,9 +174,25 @@ func (c *Socket) receive() (*os.File, error) {
 	return recvFd(uc)
 }
 
+// receiveError maps connection-level failures onto the distinguishable
+// receive errors, leaving anything else untouched.
+func receiveError(err error) error {
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return fmt.Errorf("%w: %v", ErrReceiveTimeout, err)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, unix.ECONNRESET) {
+		return ErrPeerClosed
+	}
+	return err
+}
+
 // recvFd waits for a file descriptor to be sent over the given AF_UNIX
 // socket. The file name of the remote file descriptor will be recreated
 // locally (it is sent as non-auxiliary data in the same payload).
+//
+// On success the returned file owns the received descriptor. On failure any
+// descriptor that arrived before the failure is closed before returning.
 func recvFd(socket *net.UnixConn) (*os.File, error) {
 	const MaxNameLen = 4096
 	oobSpace := unix.CmsgSpace(4)
@@ -117,19 +200,41 @@ func recvFd(socket *net.UnixConn) (*os.File, error) {
 	name := make([]byte, MaxNameLen)
 	oob := make([]byte, oobSpace)
 
-	n, oobn, _, _, err := socket.ReadMsgUnix(name, oob)
+	n, oobn, flags, _, err := socket.ReadMsgUnix(name, oob)
+	if err != nil {
+		return nil, receiveError(err)
+	}
+	if n == 0 && oobn == 0 {
+		return nil, ErrPeerClosed
+	}
+
+	// Parse whatever descriptors arrived first, so the failure paths below
+	// can release them instead of leaking them.
+	fds, err := parseFds(oob[:oobn])
 	if err != nil {
 		return nil, err
 	}
 
-	if n >= MaxNameLen || oobn != oobSpace {
-		return nil, fmt.Errorf("recvfd: incorrect number of bytes read (n=%d oobn=%d)", n, oobn)
+	if flags&unix.MSG_CTRUNC != 0 || n >= MaxNameLen {
+		closeFds(fds)
+		return nil, fmt.Errorf("%w (n=%d oobn=%d)", ErrTruncated, n, oobn)
 	}
 
-	// Truncate.
-	name = name[:n]
-	oob = oob[:oobn]
+	if len(fds) != 1 {
+		closeFds(fds)
+		return nil, fmt.Errorf("recvfd: number of fds is not 1: %d", len(fds))
+	}
+	fd := uintptr(fds[0])
 
+	return os.NewFile(fd, string(name[:n])), nil
+}
+
+// parseFds extracts the file descriptors from the ancillary data of a
+// received message.
+func parseFds(oob []byte) ([]int, error) {
+	if len(oob) == 0 {
+		return nil, nil
+	}
 	scms, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
 		return nil, err
@@ -137,16 +242,16 @@ func recvFd(socket *net.UnixConn) (*os.File, error) {
 	if len(scms) != 1 {
 		return nil, fmt.Errorf("recvfd: number of SCMs is not 1: %d", len(scms))
 	}
-	scm := scms[0]
-
-	fds, err := unix.ParseUnixRights(&scm)
+	fds, err := unix.ParseUnixRights(&scms[0])
 	if err != nil {
 		return nil, err
 	}
-	if len(fds) != 1 {
-		return nil, fmt.Errorf("recvfd: number of fds is not 1: %d", len(fds))
-	}
-	fd := uintptr(fds[0])
+	return fds, nil
+}
 
-	return os.NewFile(fd, string(name)), nil
+// closeFds releases descriptors that were received but cannot be handed off.
+func closeFds(fds []int) {
+	for _, fd := range fds {
+		_ = unix.Close(fd)
+	}
 }

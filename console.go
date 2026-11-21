@@ -34,11 +34,21 @@ func NewTempConsoleSocket() (*Socket, error) {
 	return newTempSocket("pty", "pty.sock")
 }
 
-// ReceiveMaster blocks until the socket receives the pty master
+// ReceiveMaster blocks until the socket receives the pty master.
+//
+// On success the returned console owns the received file descriptor. If the
+// handoff fails, the descriptor is released before the error is returned.
 func (c *Socket) ReceiveMaster() (console.Console, error) {
 	f, err := c.receive()
 	if err != nil {
 		return nil, err
 	}
-	return console.ConsoleFromFile(f)
+	cons, err := console.ConsoleFromFile(f)
+	if err != nil {
+		// The console did not take ownership of the file, so the
+		// descriptor must not be left behind.
+		_ = f.Close()
+		return nil, err
+	}
+	return cons, nil
 }

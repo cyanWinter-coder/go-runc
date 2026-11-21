@@ -21,9 +21,7 @@ package runc
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -143,25 +141,6 @@ func pidfdTargetPid(t *testing.T, pidfd *os.File) int {
 	return 0
 }
 
-// testSocketPath returns a path to bind a unix socket to. t.TempDir() is not
-// used because it derives the directory name from the test's name, which is
-// long enough here to exceed the 108 byte sun_path limit on some versions of
-// Go.
-func testSocketPath(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "gorunc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-
-	path := filepath.Join(dir, "sock")
-	if len(path) >= 108 {
-		t.Fatalf("socket path %q does not fit sun_path", path)
-	}
-	return path
-}
-
 // openPidfd opens a pidfd for pid. Pidfds need a v5.3 or newer kernel, and
 // pidfd_open may also be blocked by a sandbox, neither of which the library
 // itself requires, so the test is skipped rather than failed in those cases.
@@ -176,29 +155,4 @@ func openPidfd(t *testing.T, pid int) int {
 	}
 	t.Cleanup(func() { unix.Close(fd) })
 	return fd
-}
-
-// sendFd stands in for runc: it connects to the socket and sends fds along with
-// name as the payload, the way runc's init process does. "standard" is the name
-// runc uses for the pidfd of an init process, "setns" for an exec'd one.
-func sendFd(t *testing.T, path, name string, fds ...int) {
-	conn, err := net.Dial("unix", path)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	defer conn.Close()
-
-	uc, ok := conn.(*net.UnixConn)
-	if !ok {
-		t.Error("expected a unix connection")
-		return
-	}
-	var rights []byte
-	if len(fds) > 0 {
-		rights = unix.UnixRights(fds...)
-	}
-	if _, _, err := uc.WriteMsgUnix([]byte(name), rights, nil); err != nil {
-		t.Error(err)
-	}
 }
