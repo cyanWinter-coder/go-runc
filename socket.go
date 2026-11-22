@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,6 +34,9 @@ import (
 type Socket struct {
 	rmdir bool
 	l     *net.UnixListener
+
+	once sync.Once
+	err  error
 }
 
 // newSocket creates a new unix socket listening at the provided path.
@@ -82,15 +86,19 @@ func (c *Socket) Path() string {
 	return c.l.Addr().String()
 }
 
-// Close closes the unix socket
+// Close closes the unix socket. Close is idempotent: concurrent or repeated
+// calls are safe and return the result of the first close.
 func (c *Socket) Close() error {
-	err := c.l.Close()
-	if c.rmdir {
-		if rErr := os.RemoveAll(filepath.Dir(c.Path())); err == nil { // #nosec G703 -- rmdir is set only for sockets created in a private temporary directory.
-			err = rErr
+	c.once.Do(func() {
+		err := c.l.Close()
+		if c.rmdir {
+			if rErr := os.RemoveAll(filepath.Dir(c.Path())); err == nil { // #nosec G703 -- rmdir is set only for sockets created in a private temporary directory.
+				err = rErr
+			}
 		}
-	}
-	return err
+		c.err = err
+	})
+	return c.err
 }
 
 // receive blocks until the socket receives a file descriptor
