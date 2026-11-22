@@ -25,13 +25,18 @@ import (
 // NewPidfdSocket creates a new unix socket at the provided path to accept the
 // pidfd of the process runc creates.
 //
+// As with NewConsoleSocket, an existing path is validated rather than removed:
+// a stale socket from a crashed process of the same user is safely taken over,
+// and everything else is rejected. See Socket for the ownership details.
+//
 // Requires runc v1.2.0 or newer and a v5.3 or newer kernel.
 func NewPidfdSocket(path string) (*Socket, error) {
 	return newSocket(path)
 }
 
 // NewTempPidfdSocket returns a temp socket to accept the pidfd of the process
-// runc creates. On Close(), the socket is deleted.
+// runc creates. On Close(), the socket, its lock file and the private
+// temporary directory are deleted.
 //
 // Requires runc v1.2.0 or newer and a v5.3 or newer kernel.
 func NewTempPidfdSocket() (*Socket, error) {
