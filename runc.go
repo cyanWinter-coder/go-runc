@@ -91,6 +91,16 @@ type Runc struct {
 	PdeathSignal syscall.Signal // using syscall.Signal to allow compilation on non-unix (unix.Syscall is an alias for syscall.Signal)
 	Setpgid      bool
 
+	// KillGracePeriod bounds the time between a context cancellation and the
+	// forced termination of a still-running process.
+	//
+	// On cancellation the process is first asked to terminate gracefully
+	// (SIGTERM, or Kill on Windows). If it has not exited and its output pipes
+	// have not drained within KillGracePeriod, it is killed (SIGKILL) and any
+	// stuck I/O copiers are unblocked so that Wait always returns. A zero
+	// value means a sensible default is used.
+	KillGracePeriod time.Duration
+
 	// Criu sets the path to the criu binary used for checkpoint and restore.
 	//
 	// Deprecated: runc option --criu is now ignored (with a warning), and the
@@ -229,17 +239,7 @@ func (r *Runc) Create(context context.Context, id, bundle string, opts *CreateOp
 	if err != nil {
 		return err
 	}
-	if opts.IO != nil {
-		if c, ok := opts.IO.(StartCloser); ok {
-			if err := c.CloseAfterStart(); err != nil {
-				return err
-			}
-		}
-	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
+	_, err = r.finishCommand(cmd, ec, opts.IO)
 	return err
 }
 
@@ -330,17 +330,7 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 	if opts.Started != nil {
 		opts.Started <- cmd.Process.Pid
 	}
-	if opts.IO != nil {
-		if c, ok := opts.IO.(StartCloser); ok {
-			if err := c.CloseAfterStart(); err != nil {
-				return err
-			}
-		}
-	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
+	_, err = r.finishCommand(cmd, ec, opts.IO)
 	return err
 }
 
@@ -371,11 +361,7 @@ func (r *Runc) Run(context context.Context, id, bundle string, opts *CreateOpts)
 	if opts.Started != nil {
 		opts.Started <- cmd.Process.Pid
 	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
-	return status, err
+	return r.finishCommand(cmd, ec, opts.IO)
 }
 
 // DeleteOpts holds the deletion options for calling `runc delete`
@@ -706,18 +692,7 @@ func (r *Runc) Restore(context context.Context, id, bundle string, opts *Restore
 	if err != nil {
 		return -1, err
 	}
-	if opts != nil && opts.IO != nil {
-		if c, ok := opts.IO.(StartCloser); ok {
-			if err := c.CloseAfterStart(); err != nil {
-				return -1, err
-			}
-		}
-	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
-	return status, err
+	return r.finishCommand(cmd, ec, opts.IO)
 }
 
 // Update updates the current container with the provided resource spec
@@ -839,10 +814,7 @@ func (r *Runc) runOrError(cmd *exec.Cmd) error {
 		if err != nil {
 			return err
 		}
-		status, err := Monitor.Wait(cmd, ec)
-		if err == nil && status != 0 {
-			err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-		}
+		_, err = r.waitCommand(cmd, ec)
 		return err
 	}
 	data, err := r.cmdOutput(cmd, true, nil)
@@ -870,19 +842,49 @@ func (r *Runc) cmdOutput(cmd *exec.Cmd, combined bool, started chan<- int) (*byt
 		started <- cmd.Process.Pid
 	}
 
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
+	_, err = r.waitCommand(cmd, ec)
 
 	return b, err
 }
 
-// ExitError holds the status return code when a process exits with an error code
-type ExitError struct {
-	Status int
+// waitCommand blocks for the single exit result of a started command and
+// translates a non-zero exit into the package's ExitError taxonomy. It is
+// idempotent: repeated calls return the same status and error.
+func (r *Runc) waitCommand(cmd *exec.Cmd, ec chan Exit) (int, error) {
+	status, err := Monitor.Wait(cmd, ec)
+	if err == nil && status != 0 {
+		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
+	}
+	return status, err
 }
 
-func (e *ExitError) Error() string {
-	return fmt.Sprintf("exit status %d", e.Status)
+// finishCommand closes any start-time IO ownership before waiting. A failure
+// while closing no longer leaks the process: the process is terminated and
+// always reaped, and the closure error is joined with the wait error.
+func (r *Runc) finishCommand(cmd *exec.Cmd, ec chan Exit, io IO) (int, error) {
+	var closeErr error
+	if io != nil {
+		if c, ok := io.(StartCloser); ok {
+			closeErr = c.CloseAfterStart()
+		}
+	}
+	if closeErr != nil {
+		// The caller's IO handoff failed; don't leave the process running with
+		// nobody owning its pipes. Terminate it within the bounded grace
+		// policy, then let waitCommand reap it through the single-result path.
+		if dm, ok := Monitor.(*defaultMonitor); ok {
+			dm.terminateBounded(cmd, r.Setpgid, r.killGracePeriod())
+		} else {
+			terminateProcess(cmd, r.Setpgid)
+		}
+	}
+	status, err := r.waitCommand(cmd, ec)
+	if closeErr != nil {
+		if err != nil {
+			err = errors.Join(closeErr, err)
+		} else {
+			err = closeErr
+		}
+	}
+	return status, err
 }

@@ -22,7 +22,12 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
+
+// defaultKillGracePeriod is how long a canceled process gets to exit and
+// drain its output pipes before it is SIGKILLed.
+const defaultKillGracePeriod = 5 * time.Second
 
 func (r *Runc) command(context context.Context, args ...string) *exec.Cmd {
 	return r.commandWithCustomLogFile(context, "", args...)
@@ -43,8 +48,32 @@ func (r *Runc) commandWithCustomLogFile(context context.Context, logFile string,
 	if r.PdeathSignal != 0 {
 		cmd.SysProcAttr.Pdeathsig = r.PdeathSignal
 	}
+	r.configureLifecycle(cmd)
 
 	return cmd
+}
+
+// killGracePeriod returns the configured bounded-termination delay or the
+// default when unset.
+func (r *Runc) killGracePeriod() time.Duration {
+	if r.KillGracePeriod > 0 {
+		return r.KillGracePeriod
+	}
+	return defaultKillGracePeriod
+}
+
+// configureLifecycle installs the bounded cancellation policy on a command.
+// On context cancellation the process is terminated gracefully first; if it
+// neither exits nor drains its output pipes within the grace period, the
+// runtime sends SIGKILL and forcibly closes the pipes. Closing happens only
+// after signaling, so output already produced before termination is retained.
+func (r *Runc) configureLifecycle(cmd *exec.Cmd) {
+	delay := r.killGracePeriod()
+	setpgid := r.Setpgid
+	cmd.Cancel = func() error {
+		return cancelProcess(cmd, setpgid)
+	}
+	cmd.WaitDelay = delay
 }
 
 func filterEnv(in []string, names ...string) []string {
