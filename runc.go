@@ -145,6 +145,14 @@ type PidfdSocket interface {
 // CreateOpts holds all the options information for calling runc with supported options
 type CreateOpts struct {
 	IO
+	// CopyStreams, when set, makes the call relay the process's standard IO to
+	// the given caller-side Reader/Writer through a [Copier] instead of
+	// exposing the IO endpoints directly. The copier is closed before Run
+	// returns, so output written just before exit is drained rather than
+	// dropped. See [CopyIO] for the ownership rules.
+	CopyStreams *CopyStreams
+	// CopyOpts adjusts the copier started from CopyStreams.
+	CopyOpts []CopyOpt
 	// PidFile is a path to where a pid file should be created
 	PidFile       string
 	ConsoleSocket ConsoleSocket
@@ -211,6 +219,9 @@ func (r *Runc) Create(context context.Context, id, bundle string, opts *CreateOp
 		return err
 	}
 	args = append(args, oargs...)
+	if err := validateCopyStreams(opts.IO, opts.CopyStreams); err != nil {
+		return err
+	}
 	cmd := r.command(context, append(args, id)...)
 	if opts.IO != nil {
 		opts.Set(cmd)
@@ -225,14 +236,18 @@ func (r *Runc) Create(context context.Context, id, bundle string, opts *CreateOp
 		}
 		return nil
 	}
-	ec, err := r.startCommand(cmd)
+	copier, err := newCommandCopier(opts.IO, opts.CopyStreams, opts.CopyOpts)
 	if err != nil {
 		return err
+	}
+	ec, err := r.startCommand(cmd)
+	if err != nil {
+		return abortCommandCopier(copier, err)
 	}
 	if opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
-				return err
+				return abortCommandCopier(copier, err)
 			}
 		}
 	}
@@ -240,7 +255,7 @@ func (r *Runc) Create(context context.Context, id, bundle string, opts *CreateOp
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
 	}
-	return err
+	return finishCommandCopier(copier, err)
 }
 
 // Start will start an already created container
@@ -251,6 +266,11 @@ func (r *Runc) Start(context context.Context, id string) error {
 // ExecOpts holds optional settings when starting an exec process with runc
 type ExecOpts struct {
 	IO
+	// CopyStreams, when set, relays the process's standard IO through a
+	// [Copier]; see [CreateOpts.CopyStreams].
+	CopyStreams *CopyStreams
+	// CopyOpts adjusts the copier started from CopyStreams.
+	CopyOpts      []CopyOpt
 	LogFile       string
 	PidFile       string
 	ConsoleSocket ConsoleSocket
@@ -311,6 +331,9 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 		return err
 	}
 	args = append(args, oargs...)
+	if err := validateCopyStreams(opts.IO, opts.CopyStreams); err != nil {
+		return err
+	}
 	cmd := r.commandWithCustomLogFile(context, opts.LogFile, append(args, id)...)
 	if opts.IO != nil {
 		opts.Set(cmd)
@@ -323,9 +346,13 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 		}
 		return nil
 	}
-	ec, err := r.startCommand(cmd)
+	copier, err := newCommandCopier(opts.IO, opts.CopyStreams, opts.CopyOpts)
 	if err != nil {
 		return err
+	}
+	ec, err := r.startCommand(cmd)
+	if err != nil {
+		return abortCommandCopier(copier, err)
 	}
 	if opts.Started != nil {
 		opts.Started <- cmd.Process.Pid
@@ -333,7 +360,7 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 	if opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
-				return err
+				return abortCommandCopier(copier, err)
 			}
 		}
 	}
@@ -341,7 +368,7 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
 	}
-	return err
+	return finishCommandCopier(copier, err)
 }
 
 // Run runs the create, start, delete lifecycle of the container
@@ -359,23 +386,40 @@ func (r *Runc) Run(context context.Context, id, bundle string, opts *CreateOpts)
 		return -1, err
 	}
 	args = append(args, oargs...)
+	if err := validateCopyStreams(opts.IO, opts.CopyStreams); err != nil {
+		return -1, err
+	}
 	cmd := r.command(context, append(args, id)...)
 	if opts.IO != nil {
 		opts.Set(cmd)
 	}
 	cmd.ExtraFiles = opts.ExtraFiles
-	ec, err := r.startCommand(cmd)
+	copier, err := newCommandCopier(opts.IO, opts.CopyStreams, opts.CopyOpts)
 	if err != nil {
 		return -1, err
 	}
+	ec, err := r.startCommand(cmd)
+	if err != nil {
+		return -1, abortCommandCopier(copier, err)
+	}
 	if opts.Started != nil {
 		opts.Started <- cmd.Process.Pid
+	}
+	if copier != nil {
+		// Run has never closed the post-start IO by itself. When relaying
+		// through a copier the process-side write ends must be released after
+		// start, or the copier could never observe EOF once the process exits.
+		if c, ok := opts.IO.(StartCloser); ok {
+			if err := c.CloseAfterStart(); err != nil {
+				return -1, abortCommandCopier(copier, err)
+			}
+		}
 	}
 	status, err := Monitor.Wait(cmd, ec)
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
 	}
-	return status, err
+	return status, finishCommandCopier(copier, err)
 }
 
 // DeleteOpts holds the deletion options for calling `runc delete`
@@ -651,6 +695,11 @@ func (r *Runc) Checkpoint(context context.Context, id string, opts *CheckpointOp
 type RestoreOpts struct {
 	CheckpointOpts
 	IO
+	// CopyStreams, when set, relays the restored process's standard IO
+	// through a [Copier]; see [CreateOpts.CopyStreams].
+	CopyStreams *CopyStreams
+	// CopyOpts adjusts the copier started from CopyStreams.
+	CopyOpts []CopyOpt
 
 	Detach        bool
 	PidFile       string
@@ -698,18 +747,31 @@ func (r *Runc) Restore(context context.Context, id, bundle string, opts *Restore
 		args = append(args, oargs...)
 	}
 	args = append(args, "--bundle", bundle)
+	if opts != nil {
+		if err := validateCopyStreams(opts.IO, opts.CopyStreams); err != nil {
+			return -1, err
+		}
+	}
 	cmd := r.command(context, append(args, id)...)
 	if opts != nil && opts.IO != nil {
 		opts.Set(cmd)
 	}
+	var copier *Copier
+	if opts != nil {
+		var cerr error
+		copier, cerr = newCommandCopier(opts.IO, opts.CopyStreams, opts.CopyOpts)
+		if cerr != nil {
+			return -1, cerr
+		}
+	}
 	ec, err := r.startCommand(cmd)
 	if err != nil {
-		return -1, err
+		return -1, abortCommandCopier(copier, err)
 	}
 	if opts != nil && opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
-				return -1, err
+				return -1, abortCommandCopier(copier, err)
 			}
 		}
 	}
@@ -717,7 +779,7 @@ func (r *Runc) Restore(context context.Context, id, bundle string, opts *Restore
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
 	}
-	return status, err
+	return status, finishCommandCopier(copier, err)
 }
 
 // Update updates the current container with the provided resource spec

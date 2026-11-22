@@ -17,9 +17,11 @@
 package runc
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 )
 
 // IO is the terminal IO interface
@@ -34,6 +36,18 @@ type IO interface {
 // StartCloser is an interface to handle IO closure after start
 type StartCloser interface {
 	CloseAfterStart() error
+}
+
+// StreamOwner is implemented by IO values whose Stdin, Stdout and Stderr
+// endpoints are process-side pipe handles owned by the IO implementation.
+//
+// A [Copier] releases the endpoints it copies through only when the IO reports
+// ownership by implementing this interface and returning true. For every other
+// IO value — including [NewSTDIO] and caller-supplied implementations — the
+// copier never closes the returned descriptors, because they may refer to the
+// caller's own files.
+type StreamOwner interface {
+	OwnsStreams() bool
 }
 
 // IOOpt sets I/O creation options
@@ -68,14 +82,38 @@ func newPipe() (*pipe, error) {
 type pipe struct {
 	r *os.File
 	w *os.File
+
+	// closeOnce and the fields below make Close idempotent and safe to call
+	// concurrently from the copier, CloseAfterStart and the caller's own
+	// Close. The handles are released exactly once and every caller observes
+	// the same error.
+	closeOnce sync.Once
+	closeErr  error
 }
 
+// Close releases both ends of the pipe exactly once. The write end is closed
+// first so an outstanding relay reading the read end observes EOF; any error
+// from the write end takes precedence over one from the read end, and
+// failures from both are joined.
 func (p *pipe) Close() error {
-	err := p.w.Close()
-	if rerr := p.r.Close(); err == nil {
-		err = rerr
+	if p == nil {
+		return nil
 	}
-	return err
+	p.closeOnce.Do(func() {
+		var errs []error
+		if p.w != nil {
+			if err := p.w.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		if p.r != nil {
+			if err := p.r.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		p.closeErr = errors.Join(errs...)
+	})
+	return p.closeErr
 }
 
 // NewPipeIO creates pipe pairs to be used with runc. It is not implemented
@@ -111,6 +149,10 @@ func (i *pipeIO) Stderr() io.ReadCloser {
 	return i.err.r
 }
 
+// OwnsStreams reports that the endpoints returned by pipeIO are pipe handles
+// owned by this value, so a copier may release them.
+func (i *pipeIO) OwnsStreams() bool { return true }
+
 func (i *pipeIO) Close() error {
 	var err error
 	for _, v := range []*pipe{
@@ -127,16 +169,24 @@ func (i *pipeIO) Close() error {
 	return err
 }
 
+// CloseAfterStart releases the process-side write ends of the output pipes so
+// the consumer side observes EOF. It is idempotent and safe to call
+// concurrently with Close: an already-closed write end is not an error, and
+// any real close failure is reported instead of being discarded.
 func (i *pipeIO) CloseAfterStart() error {
+	var errs []error
 	for _, f := range []*pipe{
 		i.out,
 		i.err,
 	} {
-		if f != nil {
-			f.w.Close()
+		if f == nil || f.w == nil {
+			continue
+		}
+		if err := f.w.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Set sets the io to the exec.Cmd
@@ -194,13 +244,28 @@ func NewNullIO() (IO, error) {
 
 type nullIO struct {
 	devNull *os.File
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// close releases /dev/null exactly once. Close and CloseAfterStart share the
+// same state, so a double close (for example CloseAfterStart followed by
+// Close) reports success rather than an already-closed error.
+func (n *nullIO) close() error {
+	n.closeOnce.Do(func() {
+		if err := n.devNull.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			n.closeErr = err
+		}
+	})
+	return n.closeErr
 }
 
 func (n *nullIO) Close() error {
 	// this should be closed after start but if not
-	// make sure we close the file but don't return the error
-	n.devNull.Close()
-	return nil
+	// make sure we close the file; the error is retained for callers that
+	// close explicitly and shared with CloseAfterStart.
+	return n.close()
 }
 
 func (n *nullIO) Stdin() io.WriteCloser {
@@ -222,5 +287,5 @@ func (n *nullIO) Set(c *exec.Cmd) {
 }
 
 func (n *nullIO) CloseAfterStart() error {
-	return n.devNull.Close()
+	return n.close()
 }
