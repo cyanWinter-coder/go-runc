@@ -210,8 +210,10 @@ func TestRuncStarted(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected error from Run, but got nil")
 	}
-	if status != -1 {
-		t.Fatalf("Expected exit status 0 from Run, got %d", status)
+	// A process terminated by SIGINT reports the shell-convention status
+	// 128+SIGINT instead of an empty code.
+	if status != 130 {
+		t.Fatalf("Expected exit status 130 (128+SIGINT) from Run, got %d", status)
 	}
 
 	started = make(chan int)
@@ -227,8 +229,8 @@ func TestRuncStarted(t *testing.T) {
 		t.Fatal("Expected error from Exec, but got nil")
 	}
 	status = extractStatus(err)
-	if status != -1 {
-		t.Fatalf("Expected exit status -1 from Exec, got %d", status)
+	if status != 130 {
+		t.Fatalf("Expected exit status 130 (128+SIGINT) from Exec, got %d", status)
 	}
 
 	started = make(chan int)
@@ -249,8 +251,8 @@ func TestRuncStarted(t *testing.T) {
 		t.Fatal("Expected error from Exec, but got nil")
 	}
 	status = extractStatus(err)
-	if status != -1 {
-		t.Fatalf("Expected exit status 1 from Exec, got %d", status)
+	if status != 130 {
+		t.Fatalf("Expected exit status 130 (128+SIGINT) from Exec, got %d", status)
 	}
 }
 

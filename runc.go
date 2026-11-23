@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -105,7 +106,7 @@ type Runc struct {
 
 // List returns all containers created inside the provided runc root directory
 func (r *Runc) List(context context.Context) ([]*Container, error) {
-	data, err := r.cmdOutput(r.command(context, "list", "--format=json"), false, nil)
+	data, err := r.cmdOutput(context, r.command(context, "list", "--format=json"), false, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return nil, err
@@ -119,7 +120,7 @@ func (r *Runc) List(context context.Context) ([]*Container, error) {
 
 // State returns the state for the container provided by id
 func (r *Runc) State(context context.Context, id string) (*Container, error) {
-	data, err := r.cmdOutput(r.command(context, "state", id), true, nil)
+	data, err := r.cmdOutput(context, r.command(context, "state", id), true, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %s", err, data.String())
@@ -192,11 +193,127 @@ func (o *CreateOpts) args() (out []string, err error) {
 	return out, nil
 }
 
-func (r *Runc) startCommand(cmd *exec.Cmd) (chan Exit, error) {
-	if r.PdeathSignal != 0 {
+// startCommand starts cmd and returns the single terminal-state handle for
+// the invocation. All runc invocations funnel through here so that start,
+// reaping and resource cleanup share one terminal-state semantics: the exit
+// result is published once, Wait/Stop/Delete are idempotent, and the
+// command's state directory and pipes are released only after the process
+// reaches its terminal state.
+func (r *Runc) startCommand(cmd *exec.Cmd, opts startOptions) (ProcessHandle, error) {
+	if lm, ok := Monitor.(ProcessLifecycle); ok {
+		return lm.StartProcess(cmd, opts)
+	}
+	// Compatibility path for third-party monitors that only implement the
+	// legacy channel-based ProcessMonitor interface.
+	ch, err := r.startLegacy(cmd, opts.locked)
+	if err != nil {
+		return nil, err
+	}
+	return &legacyHandle{monitor: Monitor, cmd: cmd, ec: ch}, nil
+}
+
+func (r *Runc) startLegacy(cmd *exec.Cmd, locked bool) (chan Exit, error) {
+	if locked || r.PdeathSignal != 0 {
 		return Monitor.StartLocked(cmd)
 	}
 	return Monitor.Start(cmd)
+}
+
+// legacyHandle adapts the historical channel-based ProcessMonitor to a
+// ProcessHandle. It preserves the pre-existing semantics for monitors that
+// do not implement the bounded-termination lifecycle.
+type legacyHandle struct {
+	monitor ProcessMonitor
+	cmd     *exec.Cmd
+	ec      chan Exit
+
+	waitOnce sync.Once
+	status   int
+	waitErr  error
+}
+
+func (h *legacyHandle) Wait() (int, error) {
+	h.waitOnce.Do(func() {
+		h.status, h.waitErr = h.monitor.Wait(h.cmd, h.ec)
+	})
+	return h.status, h.waitErr
+}
+
+func (h *legacyHandle) Stop() error {
+	if h.cmd.Process != nil {
+		_ = h.cmd.Process.Kill()
+	}
+	_, err := h.Wait()
+	return err
+}
+
+func (h *legacyHandle) Delete() error {
+	_, err := h.Wait()
+	return err
+}
+
+// waitResult converts the single terminal result into the conventional
+// (status, error) return. A process that exited non-zero is surfaced as the
+// package's *ExitError, so the returned status and error always describe the
+// same reaping event and callers can extract the code with errors.As.
+// Cancellation, deadline and wait failures are passed through unwrapped,
+// preserving any context cause attached by the terminal result.
+func waitResult(status int, waitErr error) (int, error) {
+	var execErr *exec.ExitError
+	if !errors.As(waitErr, &execErr) {
+		return status, waitErr
+	}
+	exitErr := &ExitError{status}
+	switch {
+	case errors.Is(waitErr, context.Canceled):
+		return status, fmt.Errorf("%w: %w", exitErr, context.Canceled)
+	case errors.Is(waitErr, context.DeadlineExceeded):
+		return status, fmt.Errorf("%w: %w", exitErr, context.DeadlineExceeded)
+	default:
+		return status, exitErr
+	}
+}
+
+// waitCommand blocks on the handle's single terminal result and, when the
+// process exited non-zero for an ordinary reason, returns the historical
+// "did not terminate successfully" error wrapping an *ExitError. Cancellation
+// and deadline results are returned unwrapped so errors.Is(ctx.Err()) keeps
+// working (they still contain the *ExitError for status extraction).
+func waitCommand(h ProcessHandle, name string) (int, error) {
+	status, err := waitResult(h.Wait())
+	if err == nil {
+		return status, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return status, err
+	}
+	var exitErr *ExitError
+	if errors.As(err, &exitErr) {
+		return status, fmt.Errorf("%s did not terminate successfully: %w", name, exitErr)
+	}
+	return status, err
+}
+
+// newStateDir creates a private, per-command directory for transient state
+// (such as the exec process specification). The directory is removed by the
+// handle's Delete once the process has terminated, so a failed or canceled
+// command never leaves a half-started record behind.
+func newStateDir() (string, error) {
+	return os.MkdirTemp(os.Getenv("XDG_RUNTIME_DIR"), "runc-cmd")
+}
+
+// sendStarted delivers the pid over the Started channel. The send is
+// non-blocking because the Started contract requires the caller to receive
+// the pid; an abandoned invocation (for instance after cancellation) must
+// not leak the lifecycle goroutine on an unread channel.
+func sendStarted(started chan<- int, pid int) {
+	if started == nil {
+		return
+	}
+	select {
+	case started <- pid:
+	default:
+	}
 }
 
 // Create creates a new container and returns its pid if it was created successfully
@@ -218,34 +335,35 @@ func (r *Runc) Create(context context.Context, id, bundle string, opts *CreateOp
 	cmd.ExtraFiles = opts.ExtraFiles
 
 	if cmd.Stdout == nil && cmd.Stderr == nil {
-		data, err := r.cmdOutput(cmd, true, nil)
+		data, err := r.cmdOutput(context, cmd, true, nil, "")
 		defer putBuf(data)
 		if err != nil {
 			return fmt.Errorf("%s: %s", err, data.String())
 		}
 		return nil
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context})
 	if err != nil {
 		return err
 	}
+	defer ec.Delete()
 	if opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
+				// The process is already running: terminate it and wait for
+				// the terminal state before returning so it is not orphaned.
+				_ = ec.Stop()
 				return err
 			}
 		}
 	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
+	_, err = waitCommand(ec, cmd.Args[0])
 	return err
 }
 
 // Start will start an already created container
 func (r *Runc) Start(context context.Context, id string) error {
-	return r.runOrError(r.command(context, "start", id))
+	return r.runOrError(context, r.command(context, "start", id))
 }
 
 // ExecOpts holds optional settings when starting an exec process with runc
@@ -295,19 +413,32 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 	if opts.Started != nil {
 		defer close(opts.Started)
 	}
-	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "runc-process")
+	// The process spec lives in a command-private state directory which is
+	// removed by the terminal-state handle, including when start fails or the
+	// context is canceled, instead of being cleaned up independently of the
+	// process lifecycle.
+	stateDir, err := newStateDir()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
-	err = json.NewEncoder(f).Encode(spec)
-	f.Close()
+	f, err := os.CreateTemp(stateDir, "runc-process")
 	if err != nil {
+		_ = os.RemoveAll(stateDir)
+		return err
+	}
+	if err := json.NewEncoder(f).Encode(spec); err != nil {
+		_ = f.Close()
+		_ = os.RemoveAll(stateDir)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.RemoveAll(stateDir)
 		return err
 	}
 	args := []string{"exec", "--process", f.Name()}
 	oargs, err := opts.args()
 	if err != nil {
+		_ = os.RemoveAll(stateDir)
 		return err
 	}
 	args = append(args, oargs...)
@@ -316,31 +447,31 @@ func (r *Runc) Exec(context context.Context, id string, spec specs.Process, opts
 		opts.Set(cmd)
 	}
 	if cmd.Stdout == nil && cmd.Stderr == nil {
-		data, err := r.cmdOutput(cmd, true, opts.Started)
+		data, err := r.cmdOutput(context, cmd, true, opts.Started, stateDir)
 		defer putBuf(data)
 		if err != nil {
 			return fmt.Errorf("%w: %s", err, data.String())
 		}
 		return nil
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context, stateDir: stateDir, locked: r.PdeathSignal != 0})
 	if err != nil {
+		_ = os.RemoveAll(stateDir)
 		return err
 	}
+	defer ec.Delete()
 	if opts.Started != nil {
-		opts.Started <- cmd.Process.Pid
+		sendStarted(opts.Started, cmd.Process.Pid)
 	}
 	if opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
+				_ = ec.Stop()
 				return err
 			}
 		}
 	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
+	_, err = waitCommand(ec, cmd.Args[0])
 	return err
 }
 
@@ -364,18 +495,15 @@ func (r *Runc) Run(context context.Context, id, bundle string, opts *CreateOpts)
 		opts.Set(cmd)
 	}
 	cmd.ExtraFiles = opts.ExtraFiles
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context, locked: r.PdeathSignal != 0})
 	if err != nil {
 		return -1, err
 	}
+	defer ec.Delete()
 	if opts.Started != nil {
-		opts.Started <- cmd.Process.Pid
+		sendStarted(opts.Started, cmd.Process.Pid)
 	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
-	return status, err
+	return waitCommand(ec, cmd.Args[0])
 }
 
 // DeleteOpts holds the deletion options for calling `runc delete`
@@ -400,7 +528,7 @@ func (r *Runc) Delete(context context.Context, id string, opts *DeleteOpts) erro
 	if opts != nil {
 		args = append(args, opts.args()...)
 	}
-	return r.runOrError(r.command(context, append(args, id)...))
+	return r.runOrError(context, r.command(context, append(args, id)...))
 }
 
 // KillOpts specifies options for killing a container and its processes
@@ -427,7 +555,7 @@ func (r *Runc) Kill(context context.Context, id string, sig int, opts *KillOpts)
 	if opts != nil {
 		args = append(args, opts.args()...)
 	}
-	return r.runOrError(r.command(context, append(args, id, strconv.Itoa(sig))...))
+	return r.runOrError(context, r.command(context, append(args, id, strconv.Itoa(sig))...))
 }
 
 // Stats return the stats for a container like cpu, memory, and io
@@ -437,13 +565,16 @@ func (r *Runc) Stats(context context.Context, id string) (*Stats, error) {
 	if err != nil {
 		return nil, err
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context, locked: r.PdeathSignal != 0})
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		rd.Close()
-		Monitor.Wait(cmd, ec)
+		// Drain the single terminal result so the process is fully reaped
+		// even if the stats decode fails early.
+		_, _ = ec.Wait()
+		ec.Delete()
 	}()
 	var e Event
 	if err := json.NewDecoder(rd).Decode(&e); err != nil {
@@ -459,7 +590,7 @@ func (r *Runc) Events(context context.Context, id string, interval time.Duration
 	if err != nil {
 		return nil, err
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context, locked: r.PdeathSignal != 0})
 	if err != nil {
 		rd.Close()
 		return nil, err
@@ -472,7 +603,11 @@ func (r *Runc) Events(context context.Context, id string, interval time.Duration
 		defer func() {
 			close(c)
 			rd.Close()
-			Monitor.Wait(cmd, ec)
+			// Reap the process through its single terminal handle; the
+			// result is intentionally discarded because decode errors are
+			// already delivered on the event channel.
+			_, _ = ec.Wait()
+			ec.Delete()
 		}()
 		for {
 			var e Event
@@ -493,17 +628,17 @@ func (r *Runc) Events(context context.Context, id string, interval time.Duration
 
 // Pause the container with the provided id
 func (r *Runc) Pause(context context.Context, id string) error {
-	return r.runOrError(r.command(context, "pause", id))
+	return r.runOrError(context, r.command(context, "pause", id))
 }
 
 // Resume the container with the provided id
 func (r *Runc) Resume(context context.Context, id string) error {
-	return r.runOrError(r.command(context, "resume", id))
+	return r.runOrError(context, r.command(context, "resume", id))
 }
 
 // Ps lists all the processes inside the container returning their pids
 func (r *Runc) Ps(context context.Context, id string) ([]int, error) {
-	data, err := r.cmdOutput(r.command(context, "ps", "--format", "json", id), true, nil)
+	data, err := r.cmdOutput(context, r.command(context, "ps", "--format", "json", id), true, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %s", err, data.String())
@@ -517,7 +652,7 @@ func (r *Runc) Ps(context context.Context, id string) ([]int, error) {
 
 // Top lists all the processes inside the container returning the full ps data
 func (r *Runc) Top(context context.Context, id string, psOptions string) (*TopResults, error) {
-	data, err := r.cmdOutput(r.command(context, "ps", "--format", "table", id, psOptions), true, nil)
+	data, err := r.cmdOutput(context, r.command(context, "ps", "--format", "table", id, psOptions), true, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %s", err, data.String())
@@ -644,7 +779,7 @@ func (r *Runc) Checkpoint(context context.Context, id string, opts *CheckpointOp
 	}
 	cmd := r.command(context, append(args, id)...)
 	cmd.ExtraFiles = extraFiles
-	return r.runOrError(cmd)
+	return r.runOrError(context, cmd)
 }
 
 // RestoreOpts holds the options for performing a criu restore using runc
@@ -702,22 +837,20 @@ func (r *Runc) Restore(context context.Context, id, bundle string, opts *Restore
 	if opts != nil && opts.IO != nil {
 		opts.Set(cmd)
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: context, locked: r.PdeathSignal != 0})
 	if err != nil {
 		return -1, err
 	}
+	defer ec.Delete()
 	if opts != nil && opts.IO != nil {
 		if c, ok := opts.IO.(StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
+				_ = ec.Stop()
 				return -1, err
 			}
 		}
 	}
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-	}
-	return status, err
+	return waitCommand(ec, cmd.Args[0])
 }
 
 // Update updates the current container with the provided resource spec
@@ -731,7 +864,7 @@ func (r *Runc) Update(context context.Context, id string, resources *specs.Linux
 	args := []string{"update", "--resources=-", id}
 	cmd := r.command(context, args...)
 	cmd.Stdin = buf
-	return r.runOrError(cmd)
+	return r.runOrError(context, cmd)
 }
 
 // ErrParseRuncVersion is kept for backward compatibility with older versions.
@@ -748,7 +881,7 @@ type Version struct {
 
 // Version returns the runc and runtime-spec versions
 func (r *Runc) Version(context context.Context) (Version, error) {
-	data, err := r.cmdOutput(r.command(context, "--version"), false, nil)
+	data, err := r.cmdOutput(context, r.command(context, "--version"), false, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return Version{}, err
@@ -786,7 +919,7 @@ func parseVersion(data []byte) Version {
 //   - crun:  supported since crun v1.8.6
 //   - youki: https://github.com/containers/youki/issues/815
 func (r *Runc) Features(context context.Context) (*features.Features, error) {
-	data, err := r.cmdOutput(r.command(context, "features"), false, nil)
+	data, err := r.cmdOutput(context, r.command(context, "features"), false, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return nil, err
@@ -833,19 +966,17 @@ func (r *Runc) args(logFile string) (out []string) {
 // encountered and neither Stdout or Stderr was set the error and the
 // stderr of the command will be returned in the format of <error>:
 // <stderr>
-func (r *Runc) runOrError(cmd *exec.Cmd) error {
+func (r *Runc) runOrError(ctx context.Context, cmd *exec.Cmd) error {
 	if cmd.Stdout != nil || cmd.Stderr != nil {
-		ec, err := r.startCommand(cmd)
+		ec, err := r.startCommand(cmd, startOptions{ctx: ctx, locked: r.PdeathSignal != 0})
 		if err != nil {
 			return err
 		}
-		status, err := Monitor.Wait(cmd, ec)
-		if err == nil && status != 0 {
-			err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
-		}
+		defer ec.Delete()
+		_, err = waitCommand(ec, cmd.Args[0])
 		return err
 	}
-	data, err := r.cmdOutput(cmd, true, nil)
+	data, err := r.cmdOutput(ctx, cmd, true, nil, "")
 	defer putBuf(data)
 	if err != nil {
 		return fmt.Errorf("%s: %s", err, data.String())
@@ -853,26 +984,38 @@ func (r *Runc) runOrError(cmd *exec.Cmd) error {
 	return nil
 }
 
-// callers of cmdOutput are expected to call putBuf on the returned Buffer
-// to ensure it is released back to the shared pool after use.
-func (r *Runc) cmdOutput(cmd *exec.Cmd, combined bool, started chan<- int) (*bytes.Buffer, error) {
+// cmdOutput runs cmd capturing its output and returns the single terminal
+// result. stateDir, when non-empty, is a command-private directory released by
+// the terminal-state handle after reaping. Callers of cmdOutput are expected
+// to call putBuf on the returned Buffer to ensure it is released back to the
+// shared pool after use.
+func (r *Runc) cmdOutput(ctx context.Context, cmd *exec.Cmd, combined bool, started chan<- int, stateDir string) (*bytes.Buffer, error) {
 	b := getBuf()
 
 	cmd.Stdout = b
 	if combined {
 		cmd.Stderr = b
 	}
-	ec, err := r.startCommand(cmd)
+	ec, err := r.startCommand(cmd, startOptions{ctx: ctx, stateDir: stateDir, locked: r.PdeathSignal != 0})
 	if err != nil {
-		return nil, err
+		// Return the (empty) buffer rather than nil so callers can safely
+		// read it and release it through their deferred putBuf. The state
+		// directory is already removed by the monitor's start-failure path;
+		// RemoveAll here is an idempotent safety net.
+		if stateDir != "" {
+			_ = os.RemoveAll(stateDir)
+		}
+		return b, err
 	}
-	if started != nil {
-		started <- cmd.Process.Pid
+	defer ec.Delete()
+	if started != nil && cmd.Process != nil {
+		sendStarted(started, cmd.Process.Pid)
 	}
 
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], &ExitError{status})
+	_, err = waitResult(ec.Wait())
+	var exitErr *ExitError
+	if errors.As(err, &exitErr) {
+		err = fmt.Errorf("%s did not terminate successfully: %w", cmd.Args[0], exitErr)
 	}
 
 	return b, err
