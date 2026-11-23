@@ -31,6 +31,19 @@ type Exit struct {
 	Timestamp time.Time
 	Pid       int
 	Status    int
+
+	// ContainerID identifies the container scope the process generation
+	// belongs to. Empty for exits reported through the legacy ProcessMonitor.
+	ContainerID string `json:"containerId,omitempty"`
+
+	// Generation is the per-container generation of the process that
+	// exited. Zero for exits reported through the legacy ProcessMonitor.
+	Generation uint64 `json:"generation,omitempty"`
+
+	// MergedEvents reports how many intermediate watch events were merged
+	// because the event channel was full before the exit. The exit event
+	// itself is never merged.
+	MergedEvents uint64 `json:"mergedEvents,omitempty"`
 }
 
 // ProcessMonitor is an interface for process monitoring.
